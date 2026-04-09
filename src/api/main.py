@@ -1,278 +1,379 @@
-import sys
-import os
-import logging
-from typing import List, Dict, Any, Optional, Union
-import json # Added json for saving cookies
+"""FastAPI server — Alexa Tasks + Named Lists (Alexa+).
 
-# --- Path Modification ---
-# Add the project root directory to the Python path
-# This allows importing modules from the 'src' directory (e.g., alexa_shopping_list)
-project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-# --- End Path Modification ---
+New endpoints:
+  Tasks:  GET/POST /tasks, GET/PUT/DELETE /tasks/{id}, POST /tasks/{id}/complete
+  Lists:  GET /lists, GET/POST /lists/{name}/items, DELETE /lists/{name}/items/{item_id}
+
+Legacy endpoints retained for backward compat:
+  GET  /items/all, /items/incomplete, /items/completed
+  POST /items
+  DELETE /items
+  PUT  /items/mark_completed, /items/mark_incomplete
+  POST /auth/cookies
+"""
+
+import json
+import logging
+import os
+import sys
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field  # For request body validation
-
-# --- Scheduler Imports ---
+from pydantic import BaseModel, Field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from contextlib import asynccontextmanager
-import asyncio # For potential sleep in task
-# --- End Scheduler Imports ---
 
-# Import necessary components using relative imports
+# ---------------------------------------------------------------------------
+# Imports
+# ---------------------------------------------------------------------------
 try:
-    # Use the new local config
-    from . import config as api_config # Alias to avoid name clashes
-    from .alexa_api import ( # Relative import
+    from . import config as api_config
+    from .alexa_api import (
+        # Tasks
+        get_tasks,
+        create_task,
+        update_task,
+        complete_task,
+        delete_task,
+        # Lists
+        get_lists,
+        get_list_items,
+        add_list_item,
+        remove_list_item,
+        # Backward-compat shopping helpers
         get_shopping_list_items,
         add_shopping_list_item,
         delete_shopping_list_item,
         mark_item_as_completed,
         unmark_item_as_completed,
         filter_incomplete_items,
-        # No filter_completed_items, we'll do it inline
+        _probe_list_endpoints,
     )
-except ImportError as e:
-    print(f"FATAL ERROR: Could not import alexa_shopping_list modules: {e}", file=sys.stderr)
-    print("Ensure the script is run from the project root or the src directory is in PYTHONPATH.", file=sys.stderr)
+except ImportError as exc:
+    print(f"FATAL: Could not import modules: {exc}", file=sys.stderr)
     sys.exit(1)
 
-# --- Globals & Setup ---
-
-# Configure basic logging
-# Note: Uvicorn will likely handle more advanced logging config when run
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=api_config.LOG_LEVEL_INT,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-# Configure logging based on local config
-logging.basicConfig(level=api_config.LOG_LEVEL_INT, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Suppress noisy library logs based on loaded config
 if api_config.LOG_LEVEL_INT > logging.DEBUG:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("selenium").setLevel(logging.WARNING) # Likely not needed here, but safe
-    logging.getLogger("webdriver_manager").setLevel(logging.WARNING) # Likely not needed here
-    logger.debug("Suppressed noisy library logs.")
 
-# --- Scheduler Setup ---
+# ---------------------------------------------------------------------------
+# Scheduler — keep-alive + list endpoint probe
+# ---------------------------------------------------------------------------
 scheduler = AsyncIOScheduler()
 
-async def perform_keep_alive():
-    """Task to periodically fetch shopping list to keep session active."""
-    logger.info("Keep-alive task started: Attempting to fetch shopping list...")
 
-    # Check if cookies exist before attempting the request
-    cookie_path = api_config.COOKIE_PATH
-    if not os.path.exists(cookie_path):
-        logger.info(f"Keep-alive skipped: Cookie file not found at {cookie_path}. Login required.")
-        return # Skip this interval
-
+async def _keep_alive():
+    """Periodic keep-alive: fetch tasks to maintain session."""
+    if not os.path.exists(api_config.COOKIE_PATH):
+        logger.info("Keep-alive skipped: no cookie file")
+        return
     try:
-        # Call the function that gets all items, which uses make_authenticated_request
-        items = get_shopping_list_items()
-        if items is not None:
-            logger.info(f"Keep-alive successful: Fetched {len(items)} items.")
+        tasks = get_tasks()
+        if tasks is not None:
+            logger.info("Keep-alive OK: %d tasks", len(tasks))
         else:
-            # This likely means cookies are invalid/expired or another API error occurred
-            logger.warning("Keep-alive failed: Could not retrieve shopping list (cookies might be expired). Re-authentication needed.")
-    except Exception as e:
-        # Catch any unexpected error during the keep-alive attempt
-        logger.error(f"Keep-alive task encountered an unexpected error: {e}", exc_info=True)
+            logger.warning("Keep-alive failed: cookies may be expired")
+    except Exception as exc:
+        logger.error("Keep-alive error: %s", exc)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    logger.info("Starting keep-alive scheduler...")
-    # Schedule the job to run every 60 seconds
-    scheduler.add_job(perform_keep_alive, 'interval', seconds=60, id='keep_alive_job')
+    # Load persisted device config
+    api_config.load_device_config()
+
+    # Attempt to discover list endpoint at startup (non-blocking — just logs)
+    if os.path.exists(api_config.COOKIE_PATH):
+        logger.info("Probing list endpoints at startup...")
+        _probe_list_endpoints()
+
+    scheduler.add_job(_keep_alive, "interval", seconds=60, id="keep_alive")
     scheduler.start()
     yield
-    # Shutdown
-    logger.info("Shutting down keep-alive scheduler...")
     scheduler.shutdown()
 
-# --- FastAPI App Instance ---
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Alexa Shopping List API",
-    description="API to interact with an Alexa Shopping List using pre-generated cookies.",
-    version="1.0.0",
-    lifespan=lifespan # Add the lifespan manager
+    title="Alexa API (Alexa+)",
+    description="Tasks and Named Lists via the new alexa.amazon.com interface.",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
-# --- Helper Function ---
-def find_item_by_name(items: List[Dict[str, Any]], name: str) -> Dict[str, Any] | None:
-    """Finds the first item in a list matching the name (case-insensitive)."""
-    if items is None:
-        return None
-    for item in items:
-        if item.get("value", "").lower() == name.lower():
-            return item
-    return None
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
 
-# --- Pydantic Models (for Request Bodies) ---
+class TaskCreateModel(BaseModel):
+    title: str = Field(..., description="Task title / reminder label")
+    due_date: Optional[str] = Field(None, description="Optional due date (ISO 8601)")
+
+
+class TaskUpdateModel(BaseModel):
+    title: str = Field(..., description="New task title")
+
+
+class ListItemModel(BaseModel):
+    value: str = Field(..., description="Item text")
+
+
 class ItemNameModel(BaseModel):
-    item_name: str = Field(..., description="The name of the shopping list item.")
+    item_name: str = Field(..., description="Shopping list item name (legacy)")
 
-# Define a Pydantic model for the expected cookie structure (adjust if needed)
+
 class CookieModel(BaseModel):
     name: str
     value: str
     domain: Optional[str] = None
     path: Optional[str] = None
-    # Add missing fields based on what login.py sends
-    expires: Optional[Union[str, int, float]] = None # Allow various types for expiry
+    expires: Optional[Union[str, int, float]] = None
     secure: Optional[bool] = None
     httpOnly: Optional[bool] = None
-    # sameSite: Optional[str] = None # Could add if needed
 
-# --- API Endpoints ---
+
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+def find_item_by_name(
+    items: List[Dict[str, Any]], name: str
+) -> Optional[Dict[str, Any]]:
+    if not items:
+        return None
+    for item in items:
+        if (item.get("value") or "").lower() == name.lower():
+            return item
+    return None
+
+
+def _task_id(task: Dict[str, Any]) -> str:
+    """Extract the canonical task identifier."""
+    return task.get("notificationIndex") or task.get("id") or ""
+
+
+# ===========================================================================
+# ROOT
+# ===========================================================================
 
 @app.get("/", tags=["Status"])
 async def read_root():
-    """Simple health check endpoint."""
-    return {"status": "Alexa Shopping List API is running"}
+    return {"status": "Alexa API (Alexa+) is running", "version": "2.0.0"}
 
-@app.get("/items/all", tags=["Items"], response_model=List[Dict[str, Any]])
-async def get_all_list_items():
-    """Retrieves all items (completed and incomplete) from the shopping list."""
-    logger.info("Endpoint GET /items/all called.")
-    items = get_shopping_list_items()
+
+# ===========================================================================
+# TASKS
+# ===========================================================================
+
+@app.get("/tasks", tags=["Tasks"])
+async def list_tasks():
+    """Return all tasks (status ON = active, OFF = completed)."""
+    tasks = get_tasks()
+    if tasks is None:
+        raise HTTPException(503, "Could not retrieve tasks from Alexa")
+    return tasks
+
+
+@app.post("/tasks", tags=["Tasks"], status_code=201)
+async def create_new_task(body: TaskCreateModel):
+    """Create a new task."""
+    result = create_task(body.title, body.due_date)
+    if result is None:
+        raise HTTPException(500, f"Failed to create task '{body.title}'")
+    return result
+
+
+@app.put("/tasks/{task_id}", tags=["Tasks"])
+async def update_task_title(task_id: str, body: TaskUpdateModel):
+    """Update a task's title (fetches current task, patches reminderLabel)."""
+    tasks = get_tasks()
+    if tasks is None:
+        raise HTTPException(503, "Could not retrieve tasks")
+    task = next((t for t in tasks if _task_id(t) == task_id), None)
+    if task is None:
+        raise HTTPException(404, f"Task '{task_id}' not found")
+    patched = dict(task)
+    patched["reminderLabel"] = body.title
+    success = update_task(task_id, patched)
+    if not success:
+        raise HTTPException(500, f"Failed to update task '{task_id}'")
+    return {"message": f"Task '{task_id}' updated"}
+
+
+@app.delete("/tasks/{task_id}", tags=["Tasks"])
+async def delete_task_endpoint(task_id: str):
+    """Delete a task entirely."""
+    success = delete_task(task_id)
+    if not success:
+        raise HTTPException(500, f"Failed to delete task '{task_id}'")
+    return {"message": f"Task '{task_id}' deleted"}
+
+
+@app.post("/tasks/{task_id}/complete", tags=["Tasks"])
+async def complete_task_endpoint(task_id: str):
+    """Mark a task as complete (sets status='OFF')."""
+    success = complete_task(task_id)
+    if not success:
+        raise HTTPException(500, f"Failed to complete task '{task_id}'")
+    return {"message": f"Task '{task_id}' marked complete"}
+
+
+# ===========================================================================
+# LISTS
+# ===========================================================================
+
+@app.get("/lists", tags=["Lists"])
+async def list_all_lists():
+    """Return all named lists with their item counts."""
+    lists = get_lists()
+    if lists is None:
+        raise HTTPException(503, "Could not retrieve lists from Alexa. Cookies may be missing or expired.")
+    return lists
+
+
+@app.get("/lists/{list_name}/items", tags=["Lists"])
+async def get_items_for_list(list_name: str):
+    """Return all items in the named list."""
+    items = get_list_items(list_name)
     if items is None:
-        logger.error("Failed to retrieve items from Alexa API.")
-        raise HTTPException(status_code=503, detail="Could not retrieve shopping list from Alexa.")
+        raise HTTPException(404, f"List '{list_name}' not found or could not retrieve items")
     return items
 
-@app.get("/items/incomplete", tags=["Items"], response_model=List[Dict[str, Any]])
+
+@app.post("/lists/{list_name}/items", tags=["Lists"], status_code=201)
+async def add_item_to_list(list_name: str, body: ListItemModel):
+    """Add an item to the named list."""
+    success = add_list_item(list_name, body.value)
+    if not success:
+        raise HTTPException(500, f"Failed to add item to list '{list_name}'")
+    return {"message": f"Item '{body.value}' added to list '{list_name}'"}
+
+
+@app.delete("/lists/{list_name}/items/{item_id}", tags=["Lists"])
+async def remove_item_from_list(list_name: str, item_id: str):
+    """Remove an item from the named list by item ID."""
+    success = remove_list_item(list_name, item_id)
+    if not success:
+        raise HTTPException(500, f"Failed to remove item '{item_id}' from list '{list_name}'")
+    return {"message": f"Item '{item_id}' removed from list '{list_name}'"}
+
+
+# ===========================================================================
+# LEGACY — /items/* (backward compat)
+# ===========================================================================
+
+@app.get("/items/all", tags=["Legacy-Shopping"], response_model=List[Dict[str, Any]])
+async def get_all_list_items():
+    items = get_shopping_list_items()
+    if items is None:
+        raise HTTPException(503, "Could not retrieve shopping list from Alexa")
+    return items
+
+
+@app.get("/items/incomplete", tags=["Legacy-Shopping"], response_model=List[Dict[str, Any]])
 async def get_incomplete_list_items():
-    """Retrieves only the incomplete items from the shopping list."""
-    logger.info("Endpoint GET /items/incomplete called.")
-    all_items = get_shopping_list_items() # No longer needs config passed
-    if all_items is None:
-        logger.error("Failed to retrieve items from Alexa API.")
-        raise HTTPException(status_code=503, detail="Could not retrieve shopping list from Alexa.")
-    incomplete_items = filter_incomplete_items(all_items)
-    return incomplete_items
+    items = get_shopping_list_items()
+    if items is None:
+        raise HTTPException(503, "Could not retrieve shopping list from Alexa")
+    return filter_incomplete_items(items)
 
-@app.get("/items/completed", tags=["Items"], response_model=List[Dict[str, Any]])
+
+@app.get("/items/completed", tags=["Legacy-Shopping"], response_model=List[Dict[str, Any]])
 async def get_completed_list_items():
-    """Retrieves only the completed items from the shopping list."""
-    logger.info("Endpoint GET /items/completed called.")
-    all_items = get_shopping_list_items() # No longer needs config passed
-    if all_items is None:
-        logger.error("Failed to retrieve items from Alexa API.")
-        raise HTTPException(status_code=503, detail="Could not retrieve shopping list from Alexa.")
-    # Filter completed items directly
-    completed_items = [item for item in all_items if item.get('completed', False)]
-    return completed_items
+    items = get_shopping_list_items()
+    if items is None:
+        raise HTTPException(503, "Could not retrieve shopping list from Alexa")
+    return [item for item in items if item.get("completed", False)]
 
-@app.post("/items", tags=["Items"], status_code=201)  # 201 Created
+
+@app.post("/items", tags=["Legacy-Shopping"], status_code=201)
 async def add_new_item(item_data: ItemNameModel):
-    """Adds a new item to the shopping list."""
-    item_name = item_data.item_name
-    logger.info(f"Endpoint POST /items called to add: '{item_name}'")
-    success = add_shopping_list_item(item_name) # No longer needs config passed
+    success = add_shopping_list_item(item_data.item_name)
     if not success:
-        logger.error(f"Failed to add item '{item_name}' via Alexa API.")
-        raise HTTPException(status_code=500, detail=f"Failed to add item '{item_name}'.")
-    return {"message": f"Item '{item_name}' added successfully."}
+        raise HTTPException(500, f"Failed to add item '{item_data.item_name}'")
+    return {"message": f"Item '{item_data.item_name}' added successfully"}
 
-@app.delete("/items", tags=["Items"])
+
+@app.delete("/items", tags=["Legacy-Shopping"])
 async def remove_item(item_data: ItemNameModel):
-    """Deletes an item from the shopping list by name (case-insensitive)."""
-    item_name = item_data.item_name
-    logger.info(f"Endpoint DELETE /items called for: '{item_name}'")
-    all_items = get_shopping_list_items() # No longer needs config passed
-    item_to_delete = find_item_by_name(all_items or [], item_name)
-
-    if not item_to_delete:
-        logger.warning(f"Item '{item_name}' not found for deletion.")
-        raise HTTPException(status_code=404, detail=f"Item '{item_name}' not found.")
-
-    success = delete_shopping_list_item(item_to_delete) # No longer needs config passed
+    items = get_shopping_list_items()
+    item = find_item_by_name(items or [], item_data.item_name)
+    if not item:
+        raise HTTPException(404, f"Item '{item_data.item_name}' not found")
+    success = delete_shopping_list_item(item)
     if not success:
-        logger.error(f"Failed to delete item '{item_name}' via Alexa API.")
-        raise HTTPException(status_code=500, detail=f"Failed to delete item '{item_name}'.")
-    return {"message": f"Item '{item_name}' deleted successfully."}
+        raise HTTPException(500, f"Failed to delete item '{item_data.item_name}'")
+    return {"message": f"Item '{item_data.item_name}' deleted successfully"}
 
-@app.put("/items/mark_completed", tags=["Items"])
+
+@app.put("/items/mark_completed", tags=["Legacy-Shopping"])
 async def mark_item_complete(item_data: ItemNameModel):
-    """Marks an item as completed by name (case-insensitive)."""
-    item_name = item_data.item_name
-    logger.info(f"Endpoint PUT /items/mark_completed called for: '{item_name}'")
-    all_items = get_shopping_list_items() # No longer needs config passed
-    # Find an *incomplete* item matching the name
-    item_to_mark = find_item_by_name(filter_incomplete_items(all_items or []), item_name)
-
-    if not item_to_mark:
-        logger.warning(f"Incomplete item '{item_name}' not found to mark complete.")
-        raise HTTPException(status_code=404, detail=f"Incomplete item '{item_name}' not found.")
-
-    success = mark_item_as_completed(item_to_mark) # No longer needs config passed
+    items = get_shopping_list_items()
+    item = find_item_by_name(filter_incomplete_items(items or []), item_data.item_name)
+    if not item:
+        raise HTTPException(404, f"Incomplete item '{item_data.item_name}' not found")
+    success = mark_item_as_completed(item)
     if not success:
-        logger.error(f"Failed to mark item '{item_name}' completed via Alexa API.")
-        raise HTTPException(status_code=500, detail=f"Failed to mark item '{item_name}' as completed.")
-    return {"message": f"Item '{item_name}' marked as completed."}
+        raise HTTPException(500, f"Failed to mark '{item_data.item_name}' completed")
+    return {"message": f"Item '{item_data.item_name}' marked as completed"}
 
-@app.put("/items/mark_incomplete", tags=["Items"])
+
+@app.put("/items/mark_incomplete", tags=["Legacy-Shopping"])
 async def mark_item_incomplete_endpoint(item_data: ItemNameModel):
-    """Marks an item as incomplete by name (case-insensitive)."""
-    item_name = item_data.item_name
-    logger.info(f"Endpoint PUT /items/mark_incomplete called for: '{item_name}'")
-    all_items = get_shopping_list_items() # No longer needs config passed
-    # Find a *complete* item matching the name
-    completed_items = [item for item in (all_items or []) if item.get('completed', False)]
-    item_to_mark = find_item_by_name(completed_items, item_name)
-
-    if not item_to_mark:
-        logger.warning(f"Completed item '{item_name}' not found to mark incomplete.")
-        raise HTTPException(status_code=404, detail=f"Completed item '{item_name}' not found.")
-
-    success = unmark_item_as_completed(item_to_mark)  # No longer needs config passed
+    items = get_shopping_list_items()
+    completed = [i for i in (items or []) if i.get("completed", False)]
+    item = find_item_by_name(completed, item_data.item_name)
+    if not item:
+        raise HTTPException(404, f"Completed item '{item_data.item_name}' not found")
+    success = unmark_item_as_completed(item)
     if not success:
-        logger.error(f"Failed to mark item '{item_name}' incomplete via Alexa API.")
-        raise HTTPException(status_code=500, detail=f"Failed to mark item '{item_name}' as incomplete.")
-    return {"message": f"Item '{item_name}' marked as incomplete."}
+        raise HTTPException(500, f"Failed to mark '{item_data.item_name}' incomplete")
+    return {"message": f"Item '{item_data.item_name}' marked as incomplete"}
 
-# --- Authentication Endpoint ---
+
+# ===========================================================================
+# AUTH — cookie ingestion
+# ===========================================================================
+
 @app.post("/auth/cookies", tags=["Authentication"], status_code=200)
-async def receive_cookies(cookies_data: List[CookieModel]): # Expect a list of CookieModel
-    """Accepts cookies as JSON and saves them to the persistent data volume."""
-    # Use the COOKIE_PATH directly from the local API config
+async def receive_cookies(cookies_data: List[CookieModel]):
+    """Accept cookies as JSON and save them to the persistent data volume."""
     cookie_path = api_config.COOKIE_PATH
-    data_dir_container = os.path.dirname(cookie_path) # Get directory from the path
-
-    logger.info(f"Received {len(cookies_data)} cookies. Attempting to save as JSON to: {cookie_path}")
-
-    # Create directory if it doesn't exist
-    try:
-        os.makedirs(data_dir_container, exist_ok=True)
-    except OSError as e:
-        logger.error(f"Could not create data directory '{data_dir_container}': {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Server error: Could not create data directory.")
+    data_dir = os.path.dirname(cookie_path)
 
     try:
-        # Convert Pydantic models back to dicts for JSON serialization
-        cookies_list_of_dicts = [cookie.model_dump(exclude_unset=True) for cookie in cookies_data]
+        os.makedirs(data_dir, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(500, f"Could not create data directory: {exc}")
 
-        # Save the received cookie list as a JSON file
+    try:
+        cookies_list = [c.model_dump(exclude_unset=True) for c in cookies_data]
         with open(cookie_path, "w", encoding="utf-8") as f:
-            json.dump(cookies_list_of_dicts, f, indent=2)
+            json.dump(cookies_list, f, indent=2)
+        logger.info("Saved %d cookies to %s", len(cookies_list), cookie_path)
 
-        logger.info(f"Successfully saved cookie data as JSON to {cookie_path}")
-        return {"message": "Cookie data received and saved successfully."}
+        # Trigger list endpoint probe now that cookies are available
+        logger.info("Probing list endpoints after cookie update...")
+        _probe_list_endpoints()
 
-    except Exception as e:
-        logger.error(f"Failed to save cookie data as JSON to {cookie_path}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to save cookie data: {e}")
+        return {"message": f"Saved {len(cookies_list)} cookies successfully"}
+    except Exception as exc:
+        logger.error("Failed to save cookies: %s", exc, exc_info=True)
+        raise HTTPException(500, f"Failed to save cookie data: {exc}")
 
-# --- Optional: Add main block to run with uvicorn for direct execution ---
+
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting Uvicorn server directly for development (keep-alive active)...")
-    # Note: Host '0.0.0.0' makes it accessible on your network
-    # Use '127.0.0.1' for local access only
-    # Reload=True is for development, disable for production
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

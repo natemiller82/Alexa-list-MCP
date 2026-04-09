@@ -1,18 +1,16 @@
 # Configuration for the Auth (Login) Script
 import logging
 
-# Amazon URL for your locale (e.g., amazon.com, amazon.co.uk)
-AMAZON_URL = "https://www.amazon.com"
+# Target the new Alexa+ interface
+AMAZON_URL = "https://alexa.amazon.com"
 
-# Path where the login script temporarily saves the cookie file locally
-# before sending it to the API container.
-LOCAL_TEMP_COOKIE_PATH = "./alexa_cookie.pickle"
+# Path where the login script temporarily saves cookies before sending to API
+LOCAL_TEMP_COOKIE_PATH = "./alexa_cookie.json"
 
 # Logging level for the login script
 LOG_LEVEL = "INFO"
 
-# Host and Port of the running API container to send cookies to
-# Assumes API container is accessible on localhost from where login script runs
+# Host and Port of the running API container
 API_HOST = "localhost"
 API_PORT = 8000
 
