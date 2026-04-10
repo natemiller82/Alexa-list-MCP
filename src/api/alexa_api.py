@@ -73,7 +73,7 @@ def _build_session() -> Optional[requests.Session]:
         value = c.get("value")
         if not name or not value:
             continue
-        session.cookies.set(name=name, value=value, domain=c.get("domain"), path=c.get("path"))
+        session.cookies.set(name=name, value=value, domain=c.get("domain"), path=c.get("path") or "/")
         cookie_header_parts.append(f"{name}={value}")
         if name == "csrf":
             csrf_value = value
@@ -285,7 +285,7 @@ def _build_amazon_session() -> requests.Session:
         value = c.get("value")
         if not name or not value:
             continue
-        session.cookies.set(name=name, value=value, domain=c.get("domain"), path=c.get("path"))
+        session.cookies.set(name=name, value=value, domain=c.get("domain"), path=c.get("path") or "/")
         cookie_header_parts.append(f"{name}={value}")
         if name == "aws-waf-token":
             has_waf_token = True
