@@ -1,11 +1,12 @@
 """FastMCP server — proxies to the FastAPI backend.
 
 Tools:
-  Tasks:  get_tasks, create_task, complete_task, delete_task, update_task
-  Lists:  get_lists, get_list_items, add_list_item, remove_list_item
-  Legacy: get_all_items, get_incomplete_items, get_completed_items,
-          add_item, delete_item, mark_item_completed, mark_item_incomplete
-  Util:   check_api_status
+  Tasks:    get_tasks, create_task, complete_task, delete_task, update_task
+  Shopping: get_shopping_list, add_shopping_list_item,
+            complete_shopping_list_item, delete_shopping_list_item
+  Legacy:   get_all_items, get_incomplete_items, get_completed_items,
+            add_item, delete_item, mark_item_completed, mark_item_incomplete
+  Util:     check_api_status
 """
 
 import json
@@ -35,7 +36,7 @@ if mcp_config.LOG_LEVEL_INT > logging.DEBUG:
 API_BASE_URL = mcp_config.API_BASE_URL
 logger.info("MCP Server → API at %s", API_BASE_URL)
 
-mcp = FastMCP("Alexa (Tasks + Lists)")
+mcp = FastMCP("Alexa (Tasks + Shopping List)")
 
 
 # ---------------------------------------------------------------------------
@@ -136,58 +137,53 @@ def update_task(task_id: str, title: str) -> dict:
 
 
 # ===========================================================================
-# LIST TOOLS
+# SHOPPING LIST TOOLS  (www.amazon.com — confirmed working)
 # ===========================================================================
 
 @mcp.tool()
-def get_lists() -> list:
+def get_shopping_list() -> list:
     """
-    Returns all Alexa named lists (e.g. 'Shopping', 'Test') with metadata.
-    Returns an empty list if no lists are found or an error occurs.
+    Returns all active (incomplete) items from the Alexa Shopping list.
+    Each item includes: id, value, completed, listId, categoryValue,
+    createdDateTime, updatedDateTime.
+    Returns an error dict if amazon_cookies are not configured or the request fails.
     """
     result = _req("GET", "/lists")
     if isinstance(result, list):
         return result
     if "error" in result:
-        logger.error("get_lists error: %s", result["error"])
-        return []
-    return []
+        logger.error("get_shopping_list error: %s", result["error"])
+    return result  # return error dict so caller sees the message
 
 
 @mcp.tool()
-def get_list_items(list_name: str) -> list:
+def add_shopping_list_item(value: str) -> dict:
     """
-    Returns all items in the named Alexa list (case-insensitive name match).
-    Example: get_list_items('Shopping') or get_list_items('Test').
-    Returns an empty list if the list is not found or an error occurs.
+    Adds an item to the Alexa Shopping list.
+    'value' is the item text (e.g. 'Milk', 'Eggs').
+    Returns the created item object or an error dict.
     """
-    result = _req("GET", f"/lists/{list_name}/items")
-    if isinstance(result, list):
-        return result
-    if "error" in result:
-        logger.error("get_list_items error: %s", result["error"])
-        return []
-    return []
+    return _req("POST", "/lists", {"value": value})
 
 
 @mcp.tool()
-def add_list_item(list_name: str, value: str) -> dict:
+def complete_shopping_list_item(item_id: str) -> dict:
     """
-    Adds an item with the given text value to the named Alexa list.
-    Example: add_list_item('Shopping', 'Milk')
+    Marks the shopping list item with the given item_id as complete.
+    Use get_shopping_list() to find item IDs.
+    Returns the updated item object or an error dict.
+    """
+    return _req("PUT", f"/lists/{item_id}/complete")
+
+
+@mcp.tool()
+def delete_shopping_list_item(item_id: str) -> dict:
+    """
+    Permanently deletes the shopping list item with the given item_id.
+    Use get_shopping_list() to find item IDs.
     Returns a success message or an error dict.
     """
-    return _req("POST", f"/lists/{list_name}/items", {"value": value})
-
-
-@mcp.tool()
-def remove_list_item(list_name: str, item_id: str) -> dict:
-    """
-    Removes the item with the given item_id from the named Alexa list.
-    Use get_list_items() to discover item IDs.
-    Returns a success message or an error dict.
-    """
-    return _req("DELETE", f"/lists/{list_name}/items/{item_id}")
+    return _req("DELETE", f"/lists/{item_id}")
 
 
 # ===========================================================================

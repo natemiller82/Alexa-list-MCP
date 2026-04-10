@@ -38,18 +38,15 @@ PERSON_ID: str = os.getenv(
 )
 
 # ---------------------------------------------------------------------------
-# List endpoint — None until discovered at runtime via probe
+# Shopping List (www.amazon.com) — confirmed working endpoints
 # ---------------------------------------------------------------------------
-LIST_API_ENDPOINT: str | None = None
-
-# Candidate endpoints to probe in order (first 200-OK with list data wins)
-LIST_ENDPOINT_CANDIDATES = [
-    "/api/namedLists",
-    "/api/todos?type=SHOPPING_ITEM&size=100",
-    "/api/todos?type=TASK&size=100",
-    "/api/lists",
-    "/api/household-lists",
-]
+AMAZON_BASE_URL = "https://www.amazon.com"
+SHOPPING_LIST_BASE = f"{AMAZON_BASE_URL}/alexashoppinglists/api"
+DEFAULT_LIST_ID = (
+    "YW16bjEuYWNjb3VudC5BR1Q2VUk0TVdOU1FISlRKVE5SQ1lKNVZIRVZBLVNIT1BQSU5HX0lURU0="
+)
+# Separate cookie store for www.amazon.com (different domain/auth from alexa.amazon.com)
+AMAZON_COOKIE_PATH = "/app/data/amazon_cookies.json"
 
 # ---------------------------------------------------------------------------
 # Helpers — persist / restore device config across container restarts

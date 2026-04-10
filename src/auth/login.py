@@ -40,8 +40,10 @@ TARGET_URL = auth_config.AMAZON_URL  # https://alexa.amazon.com
 async def post_cookies_to_api(cookies: List[Dict]) -> bool:
     """POST the cookie list as JSON to the API /auth/cookies endpoint."""
     logger.info("Sending %d cookies to %s", len(cookies), auth_config.API_COOKIE_ENDPOINT)
+    # Wrap in the expected body shape; amazon_cookies can be added separately
+    body = {"alexa_cookies": cookies}
     try:
-        response = requests.post(auth_config.API_COOKIE_ENDPOINT, json=cookies, timeout=15)
+        response = requests.post(auth_config.API_COOKIE_ENDPOINT, json=body, timeout=15)
         response.raise_for_status()
         logger.info("Cookies accepted by API (HTTP %d)", response.status_code)
         return True

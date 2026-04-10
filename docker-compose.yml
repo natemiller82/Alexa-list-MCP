@@ -6,7 +6,7 @@ services:
     container_name: shopping_list_api
     ports:
       # Map host port 8000 to container port 8000 (which is defined in src/api/config.py)
-      - "8000:8000"
+      - "8686:8000"
     volumes:
       # Use a named volume for persistent data (e.g., cookies)
       - cookie_data:/app/data
